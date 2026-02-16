@@ -7,11 +7,14 @@ MXFP4 (Microscaling FP4) format:
 - Two FP4 values are packed per byte (low nibble, high nibble)
 - Each block of 32 FP4 values shares one E8M0 scale (8-bit exponent only)
 - Dequantization: fp4_to_float(nibble) * 2^(scale - 127)
+
+Output is a complete HF model directory loadable via
+AutoModelForCausalLM.from_pretrained().
 """
 
 import argparse
 import json
-import os
+import shutil
 from pathlib import Path
 from typing import Dict
 
@@ -47,6 +50,19 @@ FP4_E2M1_TABLE = torch.tensor([
   -4.0,   # 0b1110: -4.0
   -6.0,   # 0b1111: -6.0
 ], dtype=torch.float32)
+
+# Shard size target: ~5 GB
+SHARD_SIZE_BYTES = 5 * 1024 * 1024 * 1024
+
+# Tokenizer and config files to copy from the source model directory
+COPY_FILES = [
+  "tokenizer.json",
+  "tokenizer_config.json",
+  "special_tokens_map.json",
+  "merges.txt",
+  "vocab.json",
+  "generation_config.json",
+]
 
 
 def e8m0_to_float(scale: torch.Tensor) -> torch.Tensor:
@@ -96,17 +112,84 @@ def dequantize_mxfp4_block(
   return dequantized.view(*output_shape)
 
 
-def convert_mxfp4_weights(
-  input_dir: str, output_path: str, output_dtype: torch.dtype = torch.bfloat16
+def tensor_byte_size(t: torch.Tensor) -> int:
+  return t.nelement() * t.element_size()
+
+
+def save_sharded(
+  tensors: Dict[str, torch.Tensor], output_dir: Path
 ) -> None:
-  """Convert MXFP4 quantized model to unquantized safetensors.
+  """Save tensors as sharded safetensors with an index file."""
+  # Build shards by accumulating tensors until shard size is reached
+  shards: list[tuple[str, Dict[str, torch.Tensor]]] = []
+  current_shard: Dict[str, torch.Tensor] = {}
+  current_size = 0
+  shard_idx = 1
+
+  for name in sorted(tensors.keys()):
+    t = tensors[name]
+    t_size = tensor_byte_size(t)
+    if current_shard and current_size + t_size > SHARD_SIZE_BYTES:
+      shard_name = f"model-{shard_idx:05d}-of-TOTAL.safetensors"
+      shards.append((shard_name, current_shard))
+      current_shard = {}
+      current_size = 0
+      shard_idx += 1
+    current_shard[name] = t
+    current_size += t_size
+
+  if current_shard:
+    shard_name = f"model-{shard_idx:05d}-of-TOTAL.safetensors"
+    shards.append((shard_name, current_shard))
+
+  total_shards = len(shards)
+
+  # Fix up shard names with actual total count
+  final_shards = []
+  for shard_name, shard_tensors in shards:
+    final_name = shard_name.replace(
+      "TOTAL", f"{total_shards:05d}"
+    )
+    final_shards.append((final_name, shard_tensors))
+
+  # Write shard files and build weight_map
+  weight_map: Dict[str, str] = {}
+  total_size = 0
+  for shard_name, shard_tensors in final_shards:
+    shard_path = output_dir / shard_name
+    print(f"  Writing {shard_name} ({len(shard_tensors)} tensors)")
+    save_file(shard_tensors, str(shard_path))
+    for name, t in shard_tensors.items():
+      weight_map[name] = shard_name
+      total_size += tensor_byte_size(t)
+
+  # Write index
+  index = {
+    "metadata": {"total_size": total_size},
+    "weight_map": dict(sorted(weight_map.items())),
+  }
+  index_path = output_dir / "model.safetensors.index.json"
+  with open(index_path, "w") as f:
+    json.dump(index, f, indent=2)
+    f.write("\n")
+  print(f"  Index: {len(weight_map)} tensors across {total_shards} shards")
+
+
+def convert_mxfp4_weights(
+  input_dir: str,
+  output_dir: str,
+  output_dtype: torch.dtype = torch.bfloat16,
+) -> None:
+  """Convert MXFP4 quantized model to a complete HF model directory.
 
   Args:
     input_dir: Directory containing quantized safetensors and config.json
-    output_path: Path for output safetensors file
+    output_dir: Output directory (will be created)
     output_dtype: Output dtype (default bfloat16)
   """
   input_dir = Path(input_dir)
+  output_dir = Path(output_dir)
+  output_dir.mkdir(parents=True, exist_ok=True)
 
   # Load config
   with open(input_dir / "config.json") as f:
@@ -115,6 +198,26 @@ def convert_mxfp4_weights(
   quant_config = config.get("quantization_config", {})
   if quant_config.get("quant_method") != "mxfp4":
     raise ValueError(f"Expected mxfp4 quantization, got {quant_config}")
+
+  # Write config.json without quantization_config
+  out_config = {k: v for k, v in config.items() if k != "quantization_config"}
+  dtype_name = {
+    torch.bfloat16: "bfloat16",
+    torch.float16: "float16",
+    torch.float32: "float32",
+  }[output_dtype]
+  out_config["torch_dtype"] = dtype_name
+  with open(output_dir / "config.json", "w") as f:
+    json.dump(out_config, f, indent=2)
+    f.write("\n")
+  print(f"Wrote config.json (torch_dtype={dtype_name})")
+
+  # Copy tokenizer and other files
+  for fname in COPY_FILES:
+    src = input_dir / fname
+    if src.exists():
+      shutil.copy2(src, output_dir / fname)
+      print(f"Copied {fname}")
 
   # Load weight index
   with open(input_dir / "model.safetensors.index.json") as f:
@@ -169,12 +272,14 @@ def convert_mxfp4_weights(
         # Dequantize
         dequantized = dequantize_mxfp4_block(blocks, scales)
 
-        # Transpose gate_up_proj: [experts, out, in] -> [experts, in, out]
-        if False and "gate_up_proj" in base_name:
+        # Transpose 3D expert weights: [experts, out, in] -> [experts, in, out]
+        # nn.Linear stores [out, in]; nn.Parameter expects [in, out]
+        if len(dequantized.shape) == 3:
           dequantized = dequantized.transpose(-2, -1).contiguous()
 
-        # Output with .weight suffix instead of _blocks/_scales
-        output_name = base_name + ".weight"
+        # Save with bare param name (no .weight suffix) to match
+        # the model's nn.Parameter names directly
+        output_name = base_name
         output_tensors[output_name] = dequantized.to(output_dtype)
 
         processed += 2  # blocks + scales -> 1 weight
@@ -183,23 +288,27 @@ def convert_mxfp4_weights(
           f"{blocks.shape} + {scales.shape} -> {dequantized.shape}"
         )
 
-  # Save output
-  print(f"\nSaving to {output_path}...")
-  save_file(output_tensors, output_path)
-  print("Done!")
+  # Save sharded output
+  print(f"\nSaving to {output_dir}...")
+  save_sharded(output_tensors, output_dir)
 
   # Print size comparison
   input_size = sum(
     (input_dir / fn).stat().st_size for fn in files_to_weights
   )
-  output_size = Path(output_path).stat().st_size
+  output_size = sum(
+    f.stat().st_size
+    for f in output_dir.iterdir()
+    if f.suffix == ".safetensors"
+  )
   print(f"\nInput size:  {input_size / 1e9:.2f} GB")
   print(f"Output size: {output_size / 1e9:.2f} GB")
+  print("Done!")
 
 
 def main():
   parser = argparse.ArgumentParser(
-    description="Convert MXFP4 weights to unquantized safetensors"
+    description="Convert MXFP4 weights to unquantized HF model directory"
   )
   parser.add_argument(
     "input_dir",
@@ -207,9 +316,9 @@ def main():
     help="Directory containing MXFP4 quantized model",
   )
   parser.add_argument(
-    "output_path",
+    "output_dir",
     type=str,
-    help="Output safetensors file path",
+    help="Output directory for the converted model",
   )
   parser.add_argument(
     "--dtype",
@@ -226,7 +335,7 @@ def main():
     "float32": torch.float32,
   }
 
-  convert_mxfp4_weights(args.input_dir, args.output_path, dtype_map[args.dtype])
+  convert_mxfp4_weights(args.input_dir, args.output_dir, dtype_map[args.dtype])
 
 
 if __name__ == "__main__":
