@@ -272,11 +272,6 @@ def convert_mxfp4_weights(
         # Dequantize
         dequantized = dequantize_mxfp4_block(blocks, scales)
 
-        # Transpose 3D expert weights: [experts, out, in] -> [experts, in, out]
-        # nn.Linear stores [out, in]; nn.Parameter expects [in, out]
-        if len(dequantized.shape) == 3:
-          dequantized = dequantized.transpose(-2, -1).contiguous()
-
         # Save with bare param name (no .weight suffix) to match
         # the model's nn.Parameter names directly
         output_name = base_name
