@@ -54,6 +54,10 @@ def fix_expert_weights(model, weights_path: str, max_layers: int):
       remap[k] = (k[: -len(".weight")], True)
     elif k.endswith(".experts.down_proj.weight"):
       remap[k] = (k[: -len(".weight")], True)
+    elif k.endswith(".experts.gate_up_proj"):
+      remap[k] = (k, True)
+    elif k.endswith(".experts.down_proj"):
+      remap[k] = (k, True)
 
   if not remap:
     return
@@ -165,6 +169,7 @@ def main():
     config=config,
     local_files_only=True,
     dtype=torch.bfloat16,
+    ignore_mismatched_sizes=True,
   )
   fix_expert_weights(model, args.weights_dir, args.max_layers)
 
