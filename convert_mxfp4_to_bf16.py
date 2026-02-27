@@ -125,6 +125,51 @@ class TensorInfo(NamedTuple):
   source_keys: list
   is_quantized: bool
   output_size: int
+  expert_index: int = -1  # -1 for non-expert, 0..N-1 for unstacked expert
+
+
+def is_stacked_expert(name: str) -> bool:
+  """Check if tensor name is a stacked expert tensor (no per-expert index)."""
+  parts = name.split('.')
+  try:
+    idx = parts.index('experts')
+    return idx + 1 < len(parts) and not parts[idx + 1].isdigit()
+  except ValueError:
+    return False
+
+
+def unstacked_expert_name(stacked_name: str, expert_idx: int) -> str:
+  """Convert stacked name to per-expert name.
+
+  e.g. model.layers.0.mlp.experts.gate_up_proj
+    -> model.layers.0.mlp.experts.0.gate_up_proj
+  """
+  parts = stacked_name.split('.')
+  idx = parts.index('experts')
+  parts.insert(idx + 1, str(expert_idx))
+  return '.'.join(parts)
+
+
+def expand_stacked_experts(
+  output_info: Dict[str, TensorInfo], num_experts: int
+) -> Dict[str, TensorInfo]:
+  """Expand stacked expert tensors into per-expert tensors."""
+  expanded: Dict[str, TensorInfo] = {}
+  for name, info in output_info.items():
+    if is_stacked_expert(name):
+      per_expert_size = info.output_size // num_experts
+      for e in range(num_experts):
+        ename = unstacked_expert_name(name, e)
+        expanded[ename] = TensorInfo(
+          source_file=info.source_file,
+          source_keys=info.source_keys,
+          is_quantized=info.is_quantized,
+          output_size=per_expert_size,
+          expert_index=e,
+        )
+    else:
+      expanded[name] = info
+  return expanded
 
 
 def scan_weights(
@@ -216,6 +261,7 @@ def convert_mxfp4_weights(
   input_dir: str,
   output_dir: str,
   output_dtype: torch.dtype = torch.bfloat16,
+  unstack_experts: bool = False,
 ) -> None:
   """Convert MXFP4 quantized model to a complete HF model directory.
 
@@ -226,6 +272,7 @@ def convert_mxfp4_weights(
     input_dir: Directory containing quantized safetensors and config.json
     output_dir: Output directory (will be created)
     output_dtype: Output dtype (default bfloat16)
+    unstack_experts: Split stacked expert tensors into per-expert tensors
   """
   input_dir = Path(input_dir)
   output_dir = Path(output_dir)
@@ -267,6 +314,13 @@ def convert_mxfp4_weights(
   # Phase 1: Scan to build tensor metadata (shapes only, no data loaded)
   print("\nScanning weights...")
   output_info = scan_weights(input_dir, weight_map, output_dtype)
+
+  if unstack_experts:
+    num_experts = config.get("num_local_experts", 0)
+    if num_experts > 0:
+      output_info = expand_stacked_experts(output_info, num_experts)
+      print(f"Unstacking experts ({num_experts} experts per tensor)")
+
   total_tensors = len(output_info)
   print(f"Found {total_tensors} output tensors")
 
@@ -292,10 +346,28 @@ def convert_mxfp4_weights(
 
     for source_file, names in by_source.items():
       filepath = input_dir / source_file
+      stacked_cache: Dict[tuple, torch.Tensor] = {}
       with safe_open(str(filepath), framework="pt") as f:
         for name in names:
           info = output_info[name]
-          if info.is_quantized:
+          if info.expert_index >= 0:
+            # Load stacked tensor once and cache, then slice per expert
+            cache_key = tuple(info.source_keys)
+            if cache_key not in stacked_cache:
+              if info.is_quantized:
+                blocks = f.get_tensor(info.source_keys[0])
+                scales = f.get_tensor(info.source_keys[1])
+                stacked = dequantize_mxfp4_block(blocks, scales)
+                stacked_cache[cache_key] = stacked.to(output_dtype)
+                del blocks, scales, stacked
+              else:
+                stacked_cache[cache_key] = f.get_tensor(
+                  info.source_keys[0]
+                ).to(output_dtype)
+            shard_tensors[name] = stacked_cache[cache_key][
+              info.expert_index
+            ].contiguous()
+          elif info.is_quantized:
             blocks = f.get_tensor(name + "_blocks")
             scales = f.get_tensor(name + "_scales")
             dequantized = dequantize_mxfp4_block(blocks, scales)
@@ -308,6 +380,7 @@ def convert_mxfp4_weights(
 
           processed += 1
           print(f"  [{processed}/{total_tensors}] {name}")
+      del stacked_cache
 
     # Write shard and free memory
     shard_path = output_dir / shard_name
@@ -367,6 +440,11 @@ def main():
     choices=["bfloat16", "float16", "float32"],
     help="Output dtype (default: bfloat16)",
   )
+  parser.add_argument(
+    "--unstack-experts",
+    action="store_true",
+    help="Split stacked expert tensors into per-expert tensors",
+  )
   args = parser.parse_args()
 
   dtype_map = {
@@ -375,7 +453,10 @@ def main():
     "float32": torch.float32,
   }
 
-  convert_mxfp4_weights(args.input_dir, args.output_dir, dtype_map[args.dtype])
+  convert_mxfp4_weights(
+    args.input_dir, args.output_dir, dtype_map[args.dtype],
+    unstack_experts=args.unstack_experts,
+  )
 
 
 if __name__ == "__main__":
