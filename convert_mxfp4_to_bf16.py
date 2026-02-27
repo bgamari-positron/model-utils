@@ -16,7 +16,7 @@ import argparse
 import json
 import shutil
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, NamedTuple
 
 import torch
 from safetensors import safe_open
@@ -116,63 +116,100 @@ def tensor_byte_size(t: torch.Tensor) -> int:
   return t.nelement() * t.element_size()
 
 
-def save_sharded(
-  tensors: Dict[str, torch.Tensor], output_dir: Path
-) -> None:
-  """Save tensors as sharded safetensors with an index file."""
-  # Build shards by accumulating tensors until shard size is reached
-  shards: list[tuple[str, Dict[str, torch.Tensor]]] = []
-  current_shard: Dict[str, torch.Tensor] = {}
-  current_size = 0
-  shard_idx = 1
+def _dtype_size(dtype: torch.dtype) -> int:
+  return torch.tensor([], dtype=dtype).element_size()
 
-  for name in sorted(tensors.keys()):
-    t = tensors[name]
-    t_size = tensor_byte_size(t)
+
+class TensorInfo(NamedTuple):
+  source_file: str
+  source_keys: list
+  is_quantized: bool
+  output_size: int
+
+
+def scan_weights(
+  input_dir: Path, weight_map: Dict[str, str], output_dtype: torch.dtype
+) -> Dict[str, TensorInfo]:
+  """Scan weight files to build output tensor metadata without loading data.
+
+  Uses safetensors get_slice to read shapes without loading tensor data.
+  Returns a mapping from output tensor name to its metadata.
+  """
+  files_to_weights: Dict[str, list] = {}
+  for weight_name, filename in weight_map.items():
+    files_to_weights.setdefault(filename, []).append(weight_name)
+
+  elem_size = _dtype_size(output_dtype)
+  output_info: Dict[str, TensorInfo] = {}
+
+  for filename, weight_names in sorted(files_to_weights.items()):
+    filepath = input_dir / filename
+    with safe_open(str(filepath), framework="pt") as f:
+      blocks_info: Dict[str, tuple] = {}
+      scales_names: set = set()
+
+      for name in weight_names:
+        shape = f.get_slice(name).get_shape()
+
+        if name.endswith("_blocks"):
+          base_name = name[:-7]
+          # blocks: [..., num_blocks, 16] -> output: [..., num_blocks * 32]
+          # Each byte holds 2 FP4 values, so output elements = input bytes * 2
+          output_elements = 1
+          for d in shape:
+            output_elements *= d
+          output_elements *= 2
+          blocks_info[base_name] = (filename, output_elements * elem_size)
+
+        elif name.endswith("_scales"):
+          base_name = name[:-7]
+          scales_names.add(base_name)
+
+        else:
+          output_elements = 1
+          for d in shape:
+            output_elements *= d
+          output_info[name] = TensorInfo(
+            source_file=filename,
+            source_keys=[name],
+            is_quantized=False,
+            output_size=output_elements * elem_size,
+          )
+
+      for base_name, (src_file, out_size) in blocks_info.items():
+        if base_name not in scales_names:
+          raise ValueError(f"Missing scales for {base_name}")
+        output_info[base_name] = TensorInfo(
+          source_file=src_file,
+          source_keys=[base_name + "_blocks", base_name + "_scales"],
+          is_quantized=True,
+          output_size=out_size,
+        )
+
+  return output_info
+
+
+def plan_shards(
+  output_info: Dict[str, TensorInfo],
+) -> List[List[str]]:
+  """Assign output tensors to shards in sorted name order."""
+  shards: List[List[str]] = []
+  current_shard: List[str] = []
+  current_size = 0
+
+  for name in sorted(output_info.keys()):
+    t_size = output_info[name].output_size
     if current_shard and current_size + t_size > SHARD_SIZE_BYTES:
-      shard_name = f"model-{shard_idx:05d}-of-TOTAL.safetensors"
-      shards.append((shard_name, current_shard))
-      current_shard = {}
+      shards.append(current_shard)
+      current_shard = []
       current_size = 0
-      shard_idx += 1
-    current_shard[name] = t
+    current_shard.append(name)
     current_size += t_size
 
   if current_shard:
-    shard_name = f"model-{shard_idx:05d}-of-TOTAL.safetensors"
-    shards.append((shard_name, current_shard))
+    shards.append(current_shard)
 
-  total_shards = len(shards)
-
-  # Fix up shard names with actual total count
-  final_shards = []
-  for shard_name, shard_tensors in shards:
-    final_name = shard_name.replace(
-      "TOTAL", f"{total_shards:05d}"
-    )
-    final_shards.append((final_name, shard_tensors))
-
-  # Write shard files and build weight_map
-  weight_map: Dict[str, str] = {}
-  total_size = 0
-  for shard_name, shard_tensors in final_shards:
-    shard_path = output_dir / shard_name
-    print(f"  Writing {shard_name} ({len(shard_tensors)} tensors)")
-    save_file(shard_tensors, str(shard_path))
-    for name, t in shard_tensors.items():
-      weight_map[name] = shard_name
-      total_size += tensor_byte_size(t)
-
-  # Write index
-  index = {
-    "metadata": {"total_size": total_size},
-    "weight_map": dict(sorted(weight_map.items())),
-  }
-  index_path = output_dir / "model.safetensors.index.json"
-  with open(index_path, "w") as f:
-    json.dump(index, f, indent=2)
-    f.write("\n")
-  print(f"  Index: {len(weight_map)} tensors across {total_shards} shards")
+  return shards
 
 
 def convert_mxfp4_weights(
@@ -181,6 +218,9 @@ def convert_mxfp4_weights(
   output_dtype: torch.dtype = torch.bfloat16,
 ) -> None:
   """Convert MXFP4 quantized model to a complete HF model directory.
+
+  Processes one output shard at a time to keep peak memory at ~1 shard
+  rather than the entire model.
 
   Args:
     input_dir: Directory containing quantized safetensors and config.json
@@ -224,72 +264,77 @@ def convert_mxfp4_weights(
     index = json.load(f)
   weight_map = index["weight_map"]
 
-  # Group weights by file
-  files_to_weights: Dict[str, list] = {}
-  for weight_name, filename in weight_map.items():
-    if filename not in files_to_weights:
-      files_to_weights[filename] = []
-    files_to_weights[filename].append(weight_name)
+  # Phase 1: Scan to build tensor metadata (shapes only, no data loaded)
+  print("\nScanning weights...")
+  output_info = scan_weights(input_dir, weight_map, output_dtype)
+  total_tensors = len(output_info)
+  print(f"Found {total_tensors} output tensors")
 
-  # Process all weights
-  output_tensors = {}
-  total_weights = len(weight_map)
+  # Phase 2: Plan shards
+  shard_plan = plan_shards(output_info)
+  total_shards = len(shard_plan)
+  print(f"Planned {total_shards} output shards\n")
+
+  # Phase 3: Process and write one shard at a time
+  weight_map_out: Dict[str, str] = {}
+  total_size = 0
   processed = 0
 
-  for filename, weight_names in sorted(files_to_weights.items()):
-    filepath = input_dir / filename
-    print(f"Processing {filename}...")
+  for shard_idx, tensor_names in enumerate(shard_plan, 1):
+    shard_name = f"model-{shard_idx:05d}-of-{total_shards:05d}.safetensors"
+    shard_tensors: Dict[str, torch.Tensor] = {}
 
-    with safe_open(str(filepath), framework="pt") as f:
-      # Collect blocks and scales for paired dequantization
-      blocks_cache = {}
-      scales_cache = {}
+    # Group by source file to minimize file opens
+    by_source: Dict[str, List[str]] = {}
+    for name in tensor_names:
+      info = output_info[name]
+      by_source.setdefault(info.source_file, []).append(name)
 
-      for name in weight_names:
-        tensor = f.get_tensor(name)
+    for source_file, names in by_source.items():
+      filepath = input_dir / source_file
+      with safe_open(str(filepath), framework="pt") as f:
+        for name in names:
+          info = output_info[name]
+          if info.is_quantized:
+            blocks = f.get_tensor(name + "_blocks")
+            scales = f.get_tensor(name + "_scales")
+            dequantized = dequantize_mxfp4_block(blocks, scales)
+            shard_tensors[name] = dequantized.to(output_dtype)
+            del blocks, scales, dequantized
+          else:
+            tensor = f.get_tensor(info.source_keys[0])
+            shard_tensors[name] = tensor.to(output_dtype)
+            del tensor
 
-        if name.endswith("_blocks"):
-          # Store for later dequantization
-          base_name = name[:-7]  # Remove "_blocks"
-          blocks_cache[base_name] = tensor
-        elif name.endswith("_scales"):
-          base_name = name[:-7]  # Remove "_scales"
-          scales_cache[base_name] = tensor
-        else:
-          # Non-quantized weight, keep as-is or convert dtype
-          output_tensors[name] = tensor.to(output_dtype)
           processed += 1
-          print(f"  [{processed}/{total_weights}] {name}: {tensor.shape}")
+          print(f"  [{processed}/{total_tensors}] {name}")
 
-      # Dequantize MXFP4 weights
-      for base_name in blocks_cache:
-        if base_name not in scales_cache:
-          raise ValueError(f"Missing scales for {base_name}")
+    # Write shard and free memory
+    shard_path = output_dir / shard_name
+    print(f"  Writing {shard_name} ({len(shard_tensors)} tensors)")
+    save_file(shard_tensors, str(shard_path))
 
-        blocks = blocks_cache[base_name]
-        scales = scales_cache[base_name]
+    for name, t in shard_tensors.items():
+      weight_map_out[name] = shard_name
+      total_size += tensor_byte_size(t)
 
-        # Dequantize
-        dequantized = dequantize_mxfp4_block(blocks, scales)
+    del shard_tensors
 
-        # Save with bare param name (no .weight suffix) to match
-        # the model's nn.Parameter names directly
-        output_name = base_name
-        output_tensors[output_name] = dequantized.to(output_dtype)
-
-        processed += 2  # blocks + scales -> 1 weight
-        print(
-          f"  [{processed}/{total_weights}] {output_name}: "
-          f"{blocks.shape} + {scales.shape} -> {dequantized.shape}"
-        )
-
-  # Save sharded output
-  print(f"\nSaving to {output_dir}...")
-  save_sharded(output_tensors, output_dir)
+  # Write index
+  index_out = {
+    "metadata": {"total_size": total_size},
+    "weight_map": dict(sorted(weight_map_out.items())),
+  }
+  index_path = output_dir / "model.safetensors.index.json"
+  with open(index_path, "w") as f:
+    json.dump(index_out, f, indent=2)
+    f.write("\n")
+  print(f"  Index: {len(weight_map_out)} tensors across {total_shards} shards")
 
   # Print size comparison
+  all_source_files = set(weight_map.values())
   input_size = sum(
-    (input_dir / fn).stat().st_size for fn in files_to_weights
+    (input_dir / fn).stat().st_size for fn in all_source_files
   )
   output_size = sum(
     f.stat().st_size
